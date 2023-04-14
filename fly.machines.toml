@@ -25,8 +25,8 @@ internal_port = 8080
 protocol = "tcp"
 
   [services.concurrency]
-  hard_limit = 175
-  soft_limit = 150
+  hard_limit = 575
+  soft_limit = 500
   type = "connections"
 
   [[services.ports]]
@@ -35,20 +35,14 @@ protocol = "tcp"
   [[services.ports]]
   port = 8080
 
-  [[services.tcp_checks]]
-  grace_period = "10s"
-  interval = "15s"
-  restart_limit = 3
-  timeout = "3s"
-
 # DNS over TCP/TLS
 [[services]]
 internal_port = 10000
 protocol = "tcp"
 
   [services.concurrency]
-  hard_limit = 175
-  soft_limit = 150
+  hard_limit = 575
+  soft_limit = 500
   type = "connections"
 
   [[services.ports]]
@@ -57,8 +51,13 @@ protocol = "tcp"
   [[services.ports]]
   port = 10000
 
-  [[services.tcp_checks]]
-  grace_period = "10s"
-  interval = "15s"
-  restart_limit = 3
-  timeout = "3s"
+# community.fly.io/t/5490/3
+[checks]
+  [checks.up]
+    grace_period = "30s"
+    interval = "15s"
+    method = "get"
+    path = "/check"
+    port = 8888
+    timeout = "3s"
+    type = "http"
