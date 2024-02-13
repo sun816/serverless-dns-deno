@@ -32,10 +32,14 @@ export class RespData {
     this.dnsPacket = packet || null;
     /** @type {ArrayBuffer} */
     this.dnsBuffer = raw || null;
-    /** @type {Object?} */
+    /** @type {BStamp?} */
     this.stamps = stamps || {};
   }
 }
+
+/**
+ * @typedef {Object.<string, Uint16Array>} BStamp
+ */
 
 /** @returns {RResp} */
 export function emptyResponse() {
@@ -54,6 +58,12 @@ export function errResponse(id, err) {
   return new RResp(data, hasex, id, st);
 }
 
+/**
+ * @param {Object} packet
+ * @param {ArrayBuffer} raw
+ * @param {BStamp?} stamps
+ * @returns {RespData}
+ */
 export function dnsResponse(packet = null, raw = null, stamps = null) {
   if (util.emptyObj(packet) || bufutil.emptyBuf(raw)) {
     throw new Error("empty packet for dns-res");

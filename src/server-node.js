@@ -6,10 +6,12 @@
  * file, You can obtain one at http://mozilla.org/MPL/2.0/.
  */
 
-import net, { isIPv6 } from "net";
-import tls, { Server } from "tls";
-import http2 from "http2";
+import net, { isIPv6 } from "node:net";
+import * as tls from "node:tls";
+import http2 from "node:http2";
 import * as h2c from "httpx-server";
+import * as os from "node:os";
+import v8 from "node:v8";
 import { V2ProxyProtocol } from "proxy-protocol-js";
 import * as system from "./system.js";
 import { handleRequest } from "./core/doh.js";
@@ -20,14 +22,17 @@ import * as envutil from "./commons/envutil.js";
 import * as nodeutil from "./core/node/util.js";
 import * as util from "./commons/util.js";
 import "./core/node/config.js";
-import { finished } from "stream";
-import { LfuCache } from "@serverless-dns/lfu-cache";
+import { finished } from "node:stream";
+import * as nodecrypto from "./commons/crypto.js";
+// webpack can't handle node-bindings, a dependency of node-memwatch
+// github.com/webpack/webpack/issues/16029
+// import * as memwatch from "@airbnb/node-memwatch";
 
 /**
- * @typedef {import("net").Socket} Socket
- * @typedef {import("tls").TLSSocket} TLSSocket
- * @typedef {import("http2").Http2ServerRequest} Http2ServerRequest
- * @typedef {import("http2").Http2ServerResponse} Http2ServerResponse
+ * @typedef {net.Socket} Socket
+ * @typedef {tls.TLSSocket} TLSSocket
+ * @typedef {http2.Http2ServerRequest} Http2ServerRequest
+ * @typedef {http2.Http2ServerResponse} Http2ServerResponse
  */
 
 let OUR_RG_DN_RE = null; // regular dns name match
@@ -40,40 +45,134 @@ class Stats {
   constructor() {
     this.noreqs = -1;
     this.nofchecks = 0;
-    this.fasttls = 0;
-    this.totfasttls = 0;
     this.tlserr = 0;
+    this.nofdrops = 0;
+    this.nofconns = 0;
+    this.openconns = 0;
+    this.noftimeouts = 0;
+    // avg1, avg5, avg15, adj, maxconns
+    this.bp = [0, 0, 0, 0, 0];
   }
 
   str() {
     return (
-      `noreqs=${this.noreqs} nofchecks=${this.nofchecks} ` +
-      `fasttls=${this.fasttls}/${this.totfasttls} tlserr=${this.tlserr}`
+      `reqs=${this.noreqs} checks=${this.nofchecks} ` +
+      `drops=${this.nofdrops}/tot=${this.nofconns}/open=${this.openconns} ` +
+      `timeouts=${this.noftimeouts}/tlserr=${this.tlserr} ` +
+      `n=${this.bp[4]}/adj=${this.bp[3]} ` +
+      `load=${this.bp[0]}/${this.bp[1]}/${this.bp[2]}`
     );
   }
 }
 
-const stats = new Stats();
-const listeners = { connmap: [], servers: [] };
-// see also: dns-transport.js:ioTimeout
-const ioTimeoutMs = 50000; // 50 secs
-// nodejs.org/api/net.html#netcreateserveroptions-connectionlistener
-const serverOpts = {
-  keepAlive: true,
-  noDelay: true,
-};
-// nodejs.org/api/tls.html#tlscreateserveroptions-secureconnectionlistener
-const tlsOpts = {
-  handshakeTimeout: Math.max((ioTimeoutMs / 5) | 0, 7000), // ms
-  // blog.cloudflare.com/tls-session-resumption-full-speed-and-secure
-  sessionTimeout: 60 * 60 * 12, // 12 hrs
-};
-// nodejs.org/api/http2.html#http2createsecureserveroptions-onrequesthandler
-const h2Opts = {
-  allowHTTP1: true,
-};
+class Tracker {
+  constructor() {
+    this.zeroid = "";
+    /** @type {Array<Map<string, Socket>>} */
+    this.connmap = [];
+    /** @type {Array<net.Server>} */
+    this.srvs = [];
+  }
 
-const tlsSessions = new LfuCache("tlsSessions", 10000);
+  valid(id) {
+    return id != null && this.zeroid !== id;
+  }
+
+  /**
+   * @param {net.Server|tls.Server} server
+   * @returns {string}
+   */
+  sid(server) {
+    if (!server) return this.zeroid;
+
+    const saddr = server.address();
+    if (!saddr || !saddr.port) {
+      log.w("trackConn: no addr/port", saddr);
+      return this.zeroid;
+    }
+
+    return saddr.port + "";
+  }
+
+  /**
+   * @param {Socket} sock
+   * @returns {string}
+   */
+  cid(sock) {
+    if (!sock || util.emptyString(sock.remoteAddress)) return this.zeroid;
+    else return sock.remoteAddress + "|" + sock.remotePort;
+  }
+
+  trackServer(s) {
+    if (!s) return this.zeroid;
+    const mapid = this.sid(s);
+
+    if (!this.valid(mapid)) return this.zeroid;
+
+    const cmap = this.connmap[mapid];
+    if (cmap) {
+      log.w("trackServer: server already tracked?", sid);
+      return mapid;
+    }
+    this.connmap[mapid] = new Map();
+    this.srvs.push(s);
+  }
+
+  *servers() {
+    yield* this.srvs;
+  }
+
+  *conns() {
+    for (const cm of this.connmap) {
+      if (!cm) continue;
+      yield* cm.values();
+    }
+  }
+
+  /**
+   * @param {net.Server} server
+   * @param {Socket} sock
+   * @returns {string}
+   */
+  trackConn(server, sock) {
+    // if no servers are being tracked, don't track connections either
+    // happens if the server did not start or this.end was called
+    if (util.emptyArray(this.srvs)) return this.zeroid;
+    if (!server || !server.listening || !sock) return this.zeroid;
+
+    const mapid = this.sid(server);
+    const connid = this.cid(sock);
+    const cmap = this.connmap[mapid];
+    if (!this.valid(mapid) || !this.valid(connid) || !cmap) {
+      log.w("trackConn: server/socket not tracked?", mapid, connid);
+      return this.zeroid;
+    }
+
+    cmap.set(connid, sock);
+    sock.on("close", (haderr) => cmap.delete(connid));
+
+    return connid;
+  }
+
+  end() {
+    const srvs = this.srvs;
+    const cmap = this.connmap;
+    this.srvs = [];
+    this.connmap = [];
+    return [srvs, cmap];
+  }
+}
+
+// nodejs.org/api/net.html#serverlisten
+const zero6 = "::";
+const tracker = new Tracker();
+const stats = new Stats();
+const cpucount = os.cpus().length || 1;
+const adjPeriodSec = 5;
+let adjTimer = null;
+/** @type {memwatch.HeapDiff} */
+let heapdiff = null;
+
 ((main) => {
   // listen for "go" and start the server
   system.sub("go", systemUp);
@@ -86,14 +185,20 @@ const tlsSessions = new LfuCache("tlsSessions", 10000);
 async function systemDown() {
   // system-down even may arrive even before the process has had the chance
   // to start, in which case globals like env and log may not be available
-  console.warn("W rcv stop; uptime", uptime() / 60000, "mins", stats.str());
+  const upmins = (uptime() / 60000) | 0;
+  console.warn("W rcv stop; uptime", upmins, "mins", stats.str());
 
-  const srvs = listeners.servers;
-  const cmap = listeners.connmap;
-  listeners.servers = [];
-  listeners.connmap = [];
+  const shutdownTimeoutMs = envutil.shutdownTimeoutMs();
+  // servers will start rejecting conns when tracker is empty
+  const [srvs, cmap] = tracker.end();
 
-  console.warn("W", stats.str(), "; closing", cmap.length, "servers");
+  util.timeout(shutdownTimeoutMs, bye);
+
+  if (adjTimer) clearInterval(adjTimer);
+  // 0 is ignored; github.com/nodejs/node/pull/48276
+  // accept only 1 conn (which keeps health-checks happy)
+  adjustMaxConns(1);
+
   // drain all sockets stackoverflow.com/a/14636625
   // TODO: handle proxy protocol sockets
   for (const m of cmap) {
@@ -104,19 +209,17 @@ async function systemDown() {
     }
   }
 
+  // stopping net.server only stops incoming reqs; it does not
+  // close open sockets: github.com/nodejs/node/issues/2642
   for (const s of srvs) {
-    if (!s) continue;
+    if (!s || !s.listening) continue;
     const saddr = s.address();
     console.warn("W stopping...", saddr);
     s.close(() => down(saddr));
     s.unref();
   }
 
-  // in some cases, node stops listening but the process doesn't exit because
-  // of other unreleased resources (see: svc.js#systemStop); and so exit with
-  // success (exit code 0); ref: community.fly.io/t/4547/6
-  console.warn("W game over");
-  process.exit(0);
+  bye();
 }
 
 function systemUp() {
@@ -126,15 +229,38 @@ function systemUp() {
   const downloadmode = envutil.blocklistDownloadOnly();
   const profilermode = envutil.profileDnsResolves();
   const tlsoffload = envutil.isCleartext();
+  const tcpbacklog = envutil.tcpBacklog();
+  const maxconns = envutil.maxconns();
+  // see also: dns-transport.js:ioTimeout
+  const ioTimeoutMs = envutil.ioTimeoutMs();
 
   if (downloadmode) {
     log.i("in download mode, not running the dns resolver");
     return;
   } else if (profilermode) {
-    const durationms = 60 * 1000;
+    const durationms = 60 * 1000; // 1 min
     log.w("in profiler mode, run for", durationms, "and exit");
     stopAfter(durationms);
+  } else {
+    adjTimer = util.repeat(adjPeriodSec * 1000, adjustMaxConns);
+    log.i(`cpu ${cpucount}, ip ${zero6}, tcpb ${tcpbacklog}, c ${maxconns}`);
   }
+
+  // nodejs.org/api/net.html#netcreateserveroptions-connectionlistener
+  const serverOpts = {
+    keepAlive: true,
+    noDelay: true,
+  };
+  // nodejs.org/api/tls.html#tlscreateserveroptions-secureconnectionlistener
+  const tlsOpts = {
+    handshakeTimeout: Math.max((ioTimeoutMs / 2) | 0, 3 * 1000), // 3s in ms
+    // blog.cloudflare.com/tls-session-resumption-full-speed-and-secure
+    sessionTimeout: 60 * 60 * 24 * 7, // 7d in secs
+  };
+  // nodejs.org/api/http2.html#http2createsecureserveroptions-onrequesthandler
+  const h2Opts = {
+    allowHTTP1: true,
+  };
 
   if (tlsoffload) {
     // fly.io terminated tls?
@@ -146,7 +272,10 @@ function systemUp() {
     const dotct = net
       // serveTCP must eventually call machines-heartbeat
       .createServer(serverOpts, serveTCP)
-      .listen(portdot, () => up("DoT Cleartext", dotct.address()));
+      .listen(portdot, zero6, tcpbacklog, () => {
+        up("DoT Cleartext", dotct.address());
+        trapServerEvents(dotct);
+      });
 
     // DNS over HTTPS Cleartext
     // Same port for http1.1/h2 does not work on node without tls, that is,
@@ -159,17 +288,15 @@ function systemUp() {
     const dohct = h2c
       // serveHTTPS must eventually invoke machines-heartbeat
       .createServer(serverOpts, serveHTTPS)
-      .listen(portdoh, () => up("DoH Cleartext", dohct.address()));
-
-    const conns = trapServerEvents(dohct, dotct);
-    listeners.connmap = [conns];
-    listeners.servers = [dotct, dohct];
+      .listen(portdoh, zero6, tcpbacklog, () => {
+        up("DoH Cleartext", dohct.address());
+        trapServerEvents(dohct);
+      });
   } else {
     // terminate tls ourselves
     const secOpts = {
       key: envutil.tlsKey(),
       cert: envutil.tlsCrt(),
-      ticketKeys: util.tkt48(),
       ...tlsOpts,
       ...serverOpts,
     };
@@ -181,7 +308,10 @@ function systemUp() {
     const dot1 = tls
       // serveTLS must eventually invoke machines-heartbeat
       .createServer(secOpts, serveTLS)
-      .listen(portdot1, () => up("DoT", dot1.address()));
+      .listen(portdot1, zero6, tcpbacklog, () => {
+        up("DoT", dot1.address());
+        trapSecureServerEvents(dot1);
+      });
 
     // DNS over TLS w ProxyProto
     const dot2 =
@@ -189,145 +319,152 @@ function systemUp() {
       net
         // serveDoTProxyProto must evenually invoke machines-heartbeat
         .createServer(serverOpts, serveDoTProxyProto)
-        .listen(portdot2, () => up("DoT ProxyProto", dot2.address()));
+        .listen(portdot2, zero6, tcpbacklog, () => {
+          up("DoT ProxyProto", dot2.address());
+          trapServerEvents(dot2);
+        });
 
     // DNS over HTTPS
     const doh = http2
       // serveHTTPS must eventually invoke machines-heartbeat
       .createSecureServer({ ...secOpts, ...h2Opts }, serveHTTPS)
-      .listen(portdoh, () => up("DoH", doh.address()));
-
-    const conns1 = trapServerEvents(dot2);
-    const conns2 = trapSecureServerEvents(dot1, doh);
-    listeners.connmap = [conns1, conns2];
-    // may contain null elements
-    listeners.servers = [dot1, dot2, doh];
+      .listen(portdoh, zero6, tcpbacklog, () => {
+        up("DoH", doh.address());
+        trapSecureServerEvents(doh);
+      });
   }
 
-  if (envutil.httpCheck()) {
-    const portcheck = envutil.httpCheckPort();
-    const hcheck = h2c
-      .createServer(serve200)
-      .listen(portcheck, () => up("http-check", hcheck.address()));
-    listeners.connmap.push(trapServerEvents(hcheck));
-    listeners.servers.push(hcheck);
-  }
+  const portcheck = envutil.httpCheckPort();
+  const hcheck = h2c.createServer(serve200).listen(portcheck, () => {
+    up("http-check", hcheck.address());
+    trapServerEvents(hcheck);
+  });
 
-  machinesHeartbeat();
+  // if (envutil.measureHeap()) heapdiff = new memwatch.HeapDiff();
+  heartbeat();
 }
 
 /**
- * @param  {... import("http2").Http2Server | net.Server} servers
- * @returns {boolean}
+ * @param  {... import("http2").Http2Server | net.Server} s
  */
-function trapServerEvents(...servers) {
-  const conntrack = new Map();
-  servers &&
-    servers.forEach((s) => {
-      if (!s) return;
-      s.on("connection", (/** @type {net.Socket} */ socket) => {
-        // use the network five tuple instead?
-        const id = util.uid("sct");
-        conntrack.set(id, socket);
-        socket.setTimeout(ioTimeoutMs, () => {
-          log.d("tcp: incoming conn timed out; " + id);
-          socket.end();
-        });
+function trapServerEvents(s) {
+  const ioTimeoutMs = envutil.ioTimeoutMs();
 
-        socket.on("error", (err) => {
-          log.d("tcp: incoming conn closed with err; " + err.message);
-          close(socket);
-        });
+  if (!s) return;
 
-        socket.on("close", (haderr) => {
-          conntrack.delete(id);
-        });
+  tracker.trackServer(s);
 
-        socket.on("end", () => {
-          // TODO: is this needed? this is the default anyway
-          socket.end();
-        });
-      });
+  s.on("connection", (/** @type {Socket} */ socket) => {
+    stats.nofconns += 1;
+    stats.openconns += 1;
 
-      s.on("error", (err) => {
-        log.e("tcp: stop! server error; " + err.message, err);
-        stopAfter(0);
-      });
+    const id = tracker.trackConn(s, socket);
+    if (!tracker.valid(id)) {
+      log.i("tcp: not tracking; server shutting down?");
+      close(socket);
+      return;
+    }
+
+    socket.setTimeout(ioTimeoutMs, () => {
+      stats.noftimeouts += 1;
+      log.d("tcp: incoming conn timed out; " + id);
+      socket.end();
     });
 
-  return conntrack;
+    socket.on("error", (err) => {
+      log.d("tcp: incoming conn closed with err; " + err.message);
+      close(socket);
+    });
+
+    socket.on("end", () => {
+      // TODO: is this needed? this is the default anyway
+      socket.end();
+    });
+
+    socket.on("close", () => {
+      stats.openconns -= 1;
+    });
+  });
+
+  // emitted when the req is discarded due to maxConnections
+  s.on("drop", (data) => {
+    stats.nofdrops += 1;
+    stats.nofconns += 1;
+  });
+
+  s.on("error", (err) => {
+    log.e("tcp: stop! server error; " + err.message, err);
+    stopAfter(0);
+  });
 }
 
 /**
- * @param  {... import("http2").Http2SecureServer | Server} servers
- * @returns {boolean}
+ * @param  {http2.Http2SecureServer | tls.Server} s
  */
-function trapSecureServerEvents(...servers) {
-  const conntrack = new Map();
+function trapSecureServerEvents(s) {
+  const ioTimeoutMs = envutil.ioTimeoutMs();
 
-  servers &&
-    servers.forEach((s) => {
-      if (!s) return;
-      // github.com/grpc/grpc-node/blob/e6ea6f517epackages/grpc-js/src/server.ts#L392
-      s.on("secureConnection", (socket) => {
-        // use the network five tuple instead?
-        const id = util.uid("stls");
-        conntrack.set(id, socket);
-        socket.setTimeout(ioTimeoutMs, () => {
-          log.d("tls: incoming conn timed out; " + id);
-          socket.end();
-        });
+  if (!s) return;
 
-        // must be handled by Http2SecureServer, github.com/nodejs/node/issues/35824
-        socket.on("error", (err) => {
-          log.e("tls: incoming conn", id, "closed;", err.message);
-          close(socket);
-        });
+  tracker.trackServer(s);
 
-        socket.on("close", (haderr) => {
-          conntrack.delete(id);
-        });
+  // github.com/grpc/grpc-node/blob/e6ea6f517epackages/grpc-js/src/server.ts#L392
+  s.on("secureConnection", (socket) => {
+    stats.nofconns += 1;
+    stats.openconns += 1;
 
-        socket.on("end", () => {
-          // TODO: is this needed? this is the default anyway
-          socket.end();
-        });
-      });
+    const id = tracker.trackConn(s, socket);
+    if (!tracker.valid(id)) {
+      log.i("tls: not tracking; server shutting down?");
+      close(socket);
+      return;
+    }
 
-      const rottm = setInterval(() => rotateTkt(s), 86400000); // 24 hours
-      rotm.unref();
-
-      s.on("newSession", (id, data, next) => {
-        const hid = bufutil.hex(id);
-        tlsSessions.put(hid, data);
-        log.d("tls: new session; " + hid);
-        next();
-      });
-
-      s.on("resumeSession", (id, next) => {
-        const hid = bufutil.hex(id);
-        const data = tlsSessions.get(hid) || null;
-        if (data) log.d("tls: resume session; " + hid);
-        if (data) stats.fasttls += 1;
-        else stats.totfasttls += 1;
-        next(/* err*/ null, data);
-      });
-
-      s.on("error", (err) => {
-        log.e("tls: stop! server error; " + err.message, err);
-        stopAfter(0);
-      });
-
-      s.on("close", () => clearInterval(rottm));
-
-      s.on("tlsClientError", (err, /** @type {TLSSocket} */ tlsSocket) => {
-        stats.tlserr += 1;
-        log.d("tls: client err; " + err.message);
-        close(tlsSocket);
-      });
+    socket.setTimeout(ioTimeoutMs, () => {
+      stats.noftimeouts += 1;
+      log.d("tls: incoming conn timed out; " + id);
+      close(socket);
     });
 
-  return conntrack;
+    // error must be handled by Http2SecureServer
+    // github.com/nodejs/node/issues/35824
+    socket.on("error", (err) => {
+      log.e("tls: incoming conn", id, "closed;", err.message);
+      close(socket);
+    });
+
+    socket.on("end", () => {
+      // client gone, socket half-open at this point
+      // close this end of the socket, too
+      socket.end();
+    });
+
+    socket.on("close", () => {
+      stats.openconns -= 1;
+    });
+  });
+
+  util.repeat(86400000 * 7, () => rotateTkt(s)); // 7d
+
+  s.on("error", (err) => {
+    log.e("tls: stop! server error; " + err.message, err);
+    stopAfter(0);
+  });
+
+  s.on("close", () => clearInterval(rottm));
+
+  // emitted when the req is discarded due to maxConnections
+  s.on("drop", (data) => {
+    stats.nofdrops += 1;
+    stats.nofconns += 1;
+  });
+
+  s.on("tlsClientError", (err, /** @type {TLSSocket} */ tlsSocket) => {
+    stats.tlserr += 1;
+    // fly tcp healthchecks also trigger tlsClientErrors
+    log.d("tls: client err; " + err.message);
+    close(tlsSocket);
+  });
 }
 
 /**
@@ -336,7 +473,22 @@ function trapSecureServerEvents(...servers) {
  */
 function rotateTkt(s) {
   if (!s || !s.listening) return;
-  s.setTicketKeys(util.tkt48());
+
+  let seed = bufutil.fromB64(envutil.secretb64());
+  if (bufutil.emptyBuf(seed)) {
+    seed = envutil.tlsKey();
+  }
+  let ctx = envutil.imageRef();
+  if (!util.emptyString(ctx)) {
+    const d = new Date();
+    const cur = d.getUTCFullYear() + " " + d.getUTCMonth(); // 2023 7
+    ctx = cur + ctx;
+  }
+
+  nodecrypto
+    .tkt48(seed, ctx)
+    .then((k) => s.setTicketKeys(k))
+    .catch((err) => log.e("tls: ticket rotation failed:", err));
 }
 
 function down(addr) {
@@ -349,22 +501,20 @@ function up(server, addr) {
 
 /**
  * RST and/or closes tcp socket.
- * @param {net.Socket | tls.TLSSocket} sock
+ * @param {Socket | TLSSocket} sock
  */
 function close(sock) {
-  sock &&
-    util.safeBox(() => {
-      if (sock.connecting) sock.resetAndDestroy();
-      else sock.destroySoon();
-      sock.unref();
-    });
+  if (!sock || sock.destroyed) return;
+  if (sock.connecting) sock.resetAndDestroy();
+  else sock.destroySoon();
+  sock.unref();
 }
 
 /**
  * @param {Http2ServerResponse} res
  */
 function resClose(res) {
-  if (res && !res.destroy) util.safeBox(() => res.destroy());
+  if (res && !res.destroy) res.destroy();
 }
 
 /**
@@ -377,7 +527,7 @@ function resOkay(res) {
 }
 
 /**
- * @param {net.Socket} sock
+ * @param {Socket} sock
  * @returns {Boolean}
  */
 function tcpOkay(sock) {
@@ -407,11 +557,11 @@ function serveDoTProxyProto(clientSocket) {
   log.d("--> new client Connection");
 
   const dotSock = net.connect(envutil.dotBackendPort(), () =>
-    log.d("DoT socket ready")
+    log.d("pp: dot socket ready")
   );
 
   dotSock.on("error", (e) => {
-    log.w("DoT socket err, close conn", e);
+    log.w("pp: dot socket err", e);
     close(clientSocket);
     close(dotSock);
   });
@@ -427,7 +577,7 @@ function serveDoTProxyProto(clientSocket) {
     ppHandled = true;
 
     if (delim < 0) {
-      log.e("proxy proto header invalid / not found =>", chunk);
+      log.e("pp: header invalid / not found =>", chunk);
       close(clientSocket);
       close(dotSock);
       return;
@@ -436,7 +586,7 @@ function serveDoTProxyProto(clientSocket) {
     try {
       // TODO: admission control
       const proto = V2ProxyProtocol.parse(chunk.slice(0, delim));
-      log.d(`--> [${proto.source.ipAddress}]:${proto.source.port}`);
+      log.d(`pp: --> [${proto.source.ipAddress}]:${proto.source.port}`);
 
       // remaining data from first tcp segment
       if (!dotSock.destroyed) dotSock.write(buf.slice(delim));
@@ -452,7 +602,7 @@ function serveDoTProxyProto(clientSocket) {
   }
 
   clientSocket.on("error", (e) => {
-    log.w("Client socket error, closing connection");
+    log.w("pp: client err, closing");
     close(clientSocket);
     close(dotSock);
   });
@@ -531,7 +681,7 @@ function getDnRE(socket) {
   // If no RegEx strings are found, a non-matching RegEx `(?!)` is returned.
   const rgDnRE = new RegExp(regExs[0].join("|") || "(?!)", "i");
   const wcDnRE = new RegExp(regExs[1].join("|") || "(?!)", "i");
-  log.i("SNIs: ", rgDnRE, wcDnRE);
+  log.i("sni:", rgDnRE, wcDnRE);
   return [rgDnRE, wcDnRE];
 }
 
@@ -569,7 +719,7 @@ function getMetadata(sni) {
 function serveTLS(socket) {
   const sni = socket.servername;
   if (!sni) {
-    log.d("No SNI, close conn");
+    log.d("no sni, close conn");
     close(socket);
     return;
   }
@@ -582,12 +732,11 @@ function serveTLS(socket) {
   const isOurWcDn = OUR_WC_DN_RE.test(sni);
 
   if (!isOurWcDn && !isOurRgDn) {
-    log.w("unexpected SNI, close conn", sni);
+    log.w("unexpected sni, close conn", sni);
     close(socket);
     return;
   }
 
-  machinesHeartbeat();
   if (false) {
     const tkt = bufutil.hex(socket.getTLSTicket());
     const sess = bufutil.hex(socket.getSession());
@@ -599,7 +748,7 @@ function serveTLS(socket) {
   const [flag, host] = isOurWcDn ? getMetadata(sni) : ["", sni];
   const sb = new ScratchBuffer();
 
-  log.d("----> DoT request", host, flag);
+  log.d("----> dot request", host, flag);
   socket.on("data", (data) => {
     handleTCPData(socket, data, sb, host, flag);
   });
@@ -614,10 +763,9 @@ function serveTCP(socket) {
   const [flag, host] = ["", "ignored.example.com"];
   const sb = new ScratchBuffer();
 
-  log.d("----> DoT Cleartext request", host, flag);
+  log.d("----> dot cleartext request", host, flag);
 
   socket.on("data", (data) => {
-    machinesHeartbeat();
     handleTCPData(socket, data, sb, host, flag);
   });
 }
@@ -649,7 +797,7 @@ function handleTCPData(socket, chunk, sb, host, flag) {
 
   const qlen = sb.qlenBuf.readUInt16BE();
   if (!dnsutil.validateSize(qlen)) {
-    log.w(`query size err: ql:${qlen} cl:${cl} rem:${rem}`);
+    log.w(`tcp: query size err: ql:${qlen} cl:${cl} rem:${rem}`);
     close(socket);
     return;
   }
@@ -670,7 +818,7 @@ function handleTCPData(socket, chunk, sb, host, flag) {
   sb.qBuf.fill(data, sb.qBufOffset);
   sb.qBufOffset += data.byteLength;
 
-  log.d(`q: ${qlen}, sb.q: ${sb.qBufOffset}, cl: ${cl}, sz: ${size}`);
+  log.d(`tcp: q: ${qlen}, sb.q: ${sb.qBufOffset}, cl: ${cl}, sz: ${size}`);
   // exactly qlen bytes read till now, handle the dns query
   if (sb.qBufOffset === qlen) {
     // extract out the query and reset the scratch-buffer
@@ -678,7 +826,7 @@ function handleTCPData(socket, chunk, sb, host, flag) {
     handleTCPQuery(b, socket, host, flag);
     // if there is any out of band data, handle it
     if (!bufutil.emptyBuf(oob)) {
-      log.d(`pipelined, handle oob: ${oob.byteLength}`);
+      log.d(`tcp: pipelined, handle oob: ${oob.byteLength}`);
       handleTCPData(socket, oob, sb, host, flag);
     }
   } // continue reading from socket
@@ -691,6 +839,8 @@ function handleTCPData(socket, chunk, sb, host, flag) {
  * @param {String} flag
  */
 async function handleTCPQuery(q, socket, host, flag) {
+  heartbeat();
+
   let ok = true;
   if (bufutil.emptyBuf(q) || !tcpOkay(socket)) return;
 
@@ -699,7 +849,7 @@ async function handleTCPQuery(q, socket, host, flag) {
   try {
     const r = await resolveQuery(rxid, q, host, flag);
     if (bufutil.emptyBuf(r)) {
-      log.w(rxid, "empty ans from resolve");
+      log.w(rxid, "tcp: empty ans from resolver");
       ok = false;
     } else {
       const rlBuf = bufutil.encodeUint8ArrayBE(r.byteLength, 2);
@@ -708,7 +858,7 @@ async function handleTCPQuery(q, socket, host, flag) {
     }
   } catch (e) {
     ok = false;
-    log.w(rxid, "send fail, err", e);
+    log.w(rxid, "tcp: send fail, err", e);
   }
   log.endTime(t);
 
@@ -720,7 +870,7 @@ async function handleTCPQuery(q, socket, host, flag) {
 
 /**
  * @param {string} rxid
- * @param {net.Socket} socket
+ * @param {Socket} socket
  * @param {Uint8Array} data
  */
 function measuredWrite(rxid, socket, data) {
@@ -778,7 +928,7 @@ async function resolveQuery(rxid, q, host, flag) {
 }
 
 async function serve200(req, res) {
-  log.d("-------------> Http-check req", req.method, req.url);
+  log.d("-------------> http-check req", req.method, req.url);
   stats.nofchecks += 1;
   res.writeHead(200);
   res.end();
@@ -813,10 +963,9 @@ async function serveHTTPS(req, res) {
     if (util.isPostRequest(req) && !dnsutil.validResponseSize(b)) {
       res.writeHead(dnsutil.dohStatusCode(b), util.corsHeadersIfNeeded(ua));
       res.end();
-      log.w(`HTTP req body length out of bounds: ${bLen}`);
+      log.w(`h2: req body length out of bounds: ${bLen}`);
     } else {
-      machinesHeartbeat();
-      log.d("----> DoH request", req.method, bLen, req.url);
+      log.d("----> doh request", req.method, bLen, req.url);
       handleHTTPRequest(b, req, res);
     }
   });
@@ -828,6 +977,8 @@ async function serveHTTPS(req, res) {
  * @param {Http2ServerResponse} res
  */
 async function handleHTTPRequest(b, req, res) {
+  heartbeat();
+
   const rxid = util.xid();
   const t = log.startTime("handle-http-req-" + rxid);
   try {
@@ -836,7 +987,7 @@ async function handleHTTPRequest(b, req, res) {
 
     // nb: req.url is a url-path, for ex: /a/b/c
     const fReq = new Request(new URL(req.url, `https://${host}`), {
-      // Note: In VM container, Object spread may not be working for all
+      // Note: In a VM container, Object spread may not be working for all
       // properties, especially of "hidden" Symbol values!? like "headers"?
       ...req,
       // TODO: populate req ip in x-nile-client-ip header
@@ -909,17 +1060,127 @@ function trapRequestResponseEvents(req, res) {
   });
 }
 
-function machinesHeartbeat() {
+function heartbeat() {
+  const maxc = envutil.maxconns();
+  const minc = envutil.minconns();
+  const measureHeap = envutil.measureHeap();
+
   // increment no of requests
   stats.noreqs += 1;
-  if (stats.noreqs % 100 === 0) {
-    log.i(stats.str(), "in", uptime() / 60000, "mins");
+
+  if (!measureHeap) {
+    endHeapDiffIfNeeded(heapdiff);
+    heapdiff = null;
+  } else if (heapdiff == null) {
+    // heapdiff = new memwatch.HeapDiff();
+  } else if (stats.noreqs % (maxc * 10) === 0) {
+    endHeapDiffIfNeeded(heapdiff);
+    // heapdiff = new memwatch.HeapDiff();
   }
-  // nothing to do, if not on fly
-  if (!envutil.onFly()) return;
-  // if a fly machine app, figure out ttl
-  const t = envutil.machinesTimeoutMillis();
-  log.d("extend-machines-ttl by", t);
-  if (t >= 0) stopAfter(t);
-  // else: not on machines
+  if (stats.noreqs % (minc * 2) === 0) {
+    log.i(stats.str(), "in", (uptime() / 60000) | 0, "mins");
+  }
+}
+
+function adjustMaxConns(n) {
+  const isNode = envutil.isNode();
+  const maxc = envutil.maxconns();
+  const minc = envutil.minconns();
+  const adjsPerSec = 60 / adjPeriodSec;
+
+  // caveats:
+  // linux-magazine.com/content/download/62593/485442/version/1/file/Load_Average.pdf
+  // brendangregg.com/blog/2017-08-08/linux-load-averages.html
+  // linuxjournal.com/article/9001
+  let [avg1, avg5, avg15] = os.loadavg();
+  avg1 = ((avg1 * 100) / cpucount) | 0;
+  avg5 = ((avg5 * 100) / cpucount) | 0;
+  avg15 = ((avg15 * 100) / cpucount) | 0;
+
+  let adj = stats.bp[3] || 0;
+  // increase in load
+  if (avg5 > 90) {
+    adj += 3;
+  } else if (avg1 > 100) {
+    adj += 2;
+  } else if (avg1 > avg5) {
+    adj += 1;
+  }
+  if (n == null) {
+    // determine n based on load-avg
+    n = maxc;
+    if (avg1 > 100) {
+      n = minc;
+    } else if (avg1 > 90 || avg5 > 80) {
+      n = Math.max((n * 0.2) | 0, minc);
+    } else if (avg1 > 80 || avg5 > 75) {
+      n = Math.max((n * 0.4) | 0, minc);
+    } else if (avg1 > 70) {
+      n = Math.max((n * 0.6) | 0, minc);
+    } else {
+      // reclaim adjs 25% at a time as n approaches maxconns
+      // ex: if adj is 100, then the decay would be,
+      // [75, 56, 42, 31, 23, 17, 12, 9, 6, 4, 3, 2, 1, 0]
+      adj = Math.max(0, adj * 0.75) | 0;
+    }
+  } else {
+    // clamp n based on a preset
+    n = Math.min(maxc, n);
+    n = Math.max(minc, n);
+    // n adjusts as per client input, not load avg
+    adj = 0;
+  }
+
+  // adjustMaxConns is called every adjPeriodSec
+  const breakpoint = 6 * adjsPerSec; // 6 mins
+  const stresspoint = 4 * adjsPerSec; // 4 mins
+  const nstr = stats.openconns + "/" + n;
+  if (adj > breakpoint) {
+    log.w("load: stopping; n:", nstr, "adjs:", adj);
+    stopAfter(0);
+    return;
+  } else if (adj > stresspoint) {
+    log.w("load: stress; n:", nstr, "adjs:", adj, "avgs:", avg1, avg5, avg15);
+    n = (minc / 2) | 0;
+  } else if (adj > 0) {
+    log.d("load: high; n:", nstr, "adjs:", adj, "avgs:", avg1, avg5, avg15);
+  }
+
+  // nodejs.org/en/docs/guides/diagnostics/memory/using-gc-traces
+  if (adj > 0) {
+    if (isNode) v8.setFlagsFromString("--trace-gc");
+  } else {
+    if (isNode) v8.setFlagsFromString("--notrace-gc");
+  }
+
+  stats.bp = [avg1, avg5, avg15, adj, n];
+  for (const s of tracker.servers()) {
+    if (!s || !s.listening) continue;
+    s.maxConnections = n;
+  }
+}
+
+/**
+ * @param {memwatch.HeapDiff} h
+ * @returns void
+ */
+function endHeapDiffIfNeeded(h) {
+  // disabled; memwatch is not bundled due to a webpack bug
+  if (!h || true) return;
+  try {
+    const diff = h.end();
+    log.i("heap before", diff.before);
+    log.i("heap after", diff.after);
+    log.i("heap details", diff.change.details);
+  } catch (ex) {
+    log.w("heap-diff err", ex.message);
+  }
+}
+
+function bye() {
+  // in some cases, node stops listening but the process doesn't exit because
+  // of other unreleased resources (see: svc.js#systemStop); and so exit with
+  // success (exit code 0) regardless; ref: community.fly.io/t/4547/6
+  console.warn("W game over");
+  process.exit(0);
 }

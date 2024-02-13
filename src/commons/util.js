@@ -186,9 +186,19 @@ export function timedSafeAsyncOp(promisedOp, ms, defaultOp) {
   });
 }
 
-export function timeout(ms, callback) {
-  if (typeof callback !== "function") return -1;
-  return setTimeout(callback, ms);
+export function timeout(ms, fn) {
+  if (typeof fn !== "function") return -1;
+  const timer = setTimeout(fn, ms);
+  if (typeof timer.unref === "function") timer.unref();
+  return timer;
+}
+
+export function repeat(ms, fn) {
+  if (typeof fn !== "function") return -1;
+  setImmediate(fn);
+  const timer = setInterval(fn, ms);
+  if (typeof timer.unref === "function") timer.unref();
+  return timer;
 }
 
 // min inclusive, max exclusive
@@ -232,56 +242,6 @@ let _vmid = "0";
 export function vmid() {
   if (_vmid === "0") _vmid = uid().slice(1);
   return _vmid;
-}
-
-// TODO: could be replaced with scheduler.wait
-// developers.cloudflare.com/workers/platform/changelog#2021-12-10
-// queues fn in a macro-task queue of the event-loop
-// exec order: github.com/nodejs/node/issues/22257
-export function taskBox(fn) {
-  timeout(/* with 0ms delay*/ 0, () => safeBox(fn));
-}
-
-// queues fn in a micro-task queue
-// ref: MDN: Web/API/HTML_DOM_API/Microtask_guide/In_depth
-// queue-task polyfill: stackoverflow.com/a/61605098
-const taskboxPromise = { p: Promise.resolve() };
-export function microtaskBox(fns, arg) {
-  let enqueue = null;
-  if (typeof queueMicrotask === "function") {
-    enqueue = queueMicrotask;
-  } else {
-    enqueue = taskboxPromise.p.then.bind(taskboxPromise.p);
-  }
-
-  enqueue(() => safeBox(fns, arg));
-}
-
-// TODO: safeBox for async fns with r.push(await f())?
-// stackoverflow.com/questions/38508420
-export function safeBox(fns, arg) {
-  if (typeof fns === "function") {
-    fns = [fns];
-  }
-
-  const r = [];
-  if (!isIterable(fns)) {
-    return r;
-  }
-
-  for (const f of fns) {
-    if (typeof f !== "function") {
-      r.push(null);
-      continue;
-    }
-    try {
-      r.push(f(arg));
-    } catch (ignore) {
-      r.push(null);
-    }
-  }
-
-  return r;
 }
 
 export function isDohGetRequest(queryString) {
@@ -368,7 +328,7 @@ export function emptyMap(m) {
 }
 
 // stackoverflow.com/a/32538867
-function isIterable(obj) {
+export function isIterable(obj) {
   if (obj == null) return false;
 
   return typeof obj[Symbol.iterator] === "function";
@@ -417,12 +377,6 @@ export function respond503() {
     status: 503, // unavailable
     headers: dohHeaders(),
   });
-}
-
-export function tkt48() {
-  const t = new Uint8Array(48);
-  crypto.getRandomValues(t);
-  return t;
 }
 
 export function logger(...tags) {

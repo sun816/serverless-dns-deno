@@ -13,28 +13,29 @@ import * as dnsutil from "../../commons/dnsutil.js";
 import * as bufutil from "../../commons/bufutil.js";
 import * as util from "../../commons/util.js";
 import * as envutil from "../../commons/envutil.js";
+import { BlocklistFilter } from "../rethinkdns/filter.js";
 
 export default class DNSResolver {
   /**
    * @param {import("../rethinkdns/main.js").BlocklistWrapper} blocklistWrapper
    * @param {import("./cache.js").DnsCache} cache
+   * @param {any} dns53
    */
-  constructor(blocklistWrapper, cache) {
+  constructor(blocklistWrapper, cache, dns53) {
     /** @type {import("./cache.js").DnsCache} */
     this.cache = cache;
     this.blocker = new DnsBlocker();
     /** @type {import("../rethinkdns/main.js").BlocklistWrapper} */
     this.bw = blocklistWrapper;
-    this.http2 = null;
-    this.nodeutil = null;
-    this.transport = null;
+    // deno bundler not happy with typedef as it imports node:dgram
+    // @type {import("../../core/node/dns-transport.js").Transport}
+    this.transport = dns53 || null;
     this.log = log.withTags("DnsResolver");
 
     this.measurements = [];
     this.profileResolve = envutil.profileDnsResolves();
     // only valid on nodejs
     this.forceDoh = envutil.forceDoh();
-    this.avoidFetch = envutil.avoidFetch();
 
     // only valid on workers
     // bg-bw-init results in higher io-wait, not lower
@@ -50,33 +51,11 @@ export default class DNSResolver {
 
     if (this.profileResolve) {
       this.log.w("profiling", this.determineDohResolvers());
-      this.log.w("doh?", this.forceDoh, "fetch?", this.avoidFetch);
-    }
-  }
-
-  async lazyInit() {
-    if (!envutil.hasDynamicImports()) return;
-
-    const isnode = envutil.isNode();
-    const plainOldDnsIp = dnsutil.dnsaddr();
-    if (isnode && !this.http2) {
-      this.http2 = await import("http2");
-      this.log.i("imported custom http2 client");
-    }
-    if (isnode && !this.nodeutil) {
-      this.nodeutil = await import("../../core/node/util.js");
-      this.log.i("imported node-util");
-    }
-    if (isnode && !this.transport) {
-      // awaiting on dns-transport takes a tad longer that more than 1 event
-      // awaiting lazyInit() trigger this part of the code and end up
-      // initializing multiple transports. This reproduces easily when 100+
-      // requests arrive at once.
-      const dnst = await import("../../core/node/dns-transport.js");
-      if (this.transport == null) {
-        this.transport = dnst.makeTransport(plainOldDnsIp, 53);
-        this.log.i("imported udp/tcp dns transport", plainOldDnsIp);
-      }
+      this.log.w("doh?", this.forceDoh);
+    } else {
+      const cok = this.cache != null;
+      const dok = this.transport != null;
+      this.log.i("init: cache?", cok, "dns53?", dok, "doh?", this.forceDoh);
     }
   }
 
@@ -98,7 +77,6 @@ export default class DNSResolver {
    * @returns {Promise<pres.RResp>}
    */
   async exec(ctx) {
-    await this.lazyInit();
     let response = pres.emptyResponse();
 
     try {
@@ -162,6 +140,7 @@ export default class DNSResolver {
    * @param {Object} ctx.userBlocklistInfo
    * @param {String} ctx.userDnsResolverUrl
    * @param {string} ctx.userBlockstamp
+   * @param {pres.BStamp?} ctx.domainBlockstamp
    * @param {function(function):void} ctx.dispatcher
    * @returns {Promise<pres.RResp>}
    */
@@ -294,6 +273,13 @@ export default class DNSResolver {
     return r;
   }
 
+  /**
+   * @param {string} rxid
+   * @param {ArrayBuffer} raw
+   * @param {BlocklistFilter} blf
+   * @param {pres.BStamp?} stamps
+   * @returns
+   */
   async makeRdnsResponse(rxid, raw, blf, stamps = null) {
     if (!raw) throw new Error(rxid + " mk-res no upstream result");
 
@@ -309,7 +295,13 @@ export default class DNSResolver {
     return pres.dnsResponse(dnsPacket, raw, stamps);
   }
 
-  primeCache(rxid, r, dispatcher) {
+  /**
+   * @param {string} rxid
+   * @param {pres.RespData} r
+   * @param {function(function):void} dispatcher
+   * @returns {Promise<void>}
+   */
+  async primeCache(rxid, r, dispatcher) {
     const blocked = r.isBlocked;
 
     const k = cacheutil.makeHttpCacheKey(r.dnsPacket);
@@ -327,6 +319,7 @@ export default class DNSResolver {
   }
 
   ofMax(blockstamp) {
+    if (util.emptyString(this.maxDoh)) return "";
     if (util.emptyString(blockstamp)) return this.maxDoh;
     else return this.maxDoh + blockstamp;
   }
@@ -359,6 +352,10 @@ DNSResolver.prototype.resolveDnsUpstream = async function (
 
   // if no doh upstreams set, resolve over plain-old dns
   if (util.emptyArray(resolverUrls)) {
+    if (this.transport == null) {
+      this.log.e(rxid, "plain dns transport not set");
+      return Promise.reject(new Error("plain dns transport not set"));
+    }
     // do not let exceptions passthrough to the caller
     try {
       const q = bufutil.bufferOf(query);
@@ -424,9 +421,7 @@ DNSResolver.prototype.resolveDnsUpstream = async function (
         throw new Error("get/post only");
       }
       this.log.d(rxid, "upstream doh2/fetch", u.href);
-      promisedPromises.push(
-        this.avoidFetch ? this.doh2(rxid, dnsreq) : fetch(dnsreq)
-      );
+      promisedPromises.push(fetch(dnsreq));
     }
   } catch (e) {
     this.log.e(rxid, "err doh2/fetch upstream", e.stack);
@@ -442,11 +437,13 @@ DNSResolver.prototype.resolveDnsFromCache = async function (rxid, packet) {
   if (!k) throw new Error("resolver: no cache-key");
 
   const cr = await this.cache.get(k);
-  const hasAns = cr && dnsutil.isAnswer(cr.dnsPacket);
-  const freshAns = hasAns && cacheutil.isAnswerFresh(cr.metadata);
-  this.log.d(rxid, "cache ans", k.href, "ans?", hasAns, "fresh?", freshAns);
+  const isAns = cr && dnsutil.isAnswer(cr.dnsPacket);
+  const hasAns = isAns && dnsutil.hasAnswers(cr.dnsPacket);
+  // if cr has answers, use probablistic expiry; otherwise prefer actual ttl
+  const fresh = isAns && cacheutil.isAnswerFresh(cr.metadata, hasAns ? 0 : 6);
+  this.log.d(rxid, "cache ans", k.href, "ans?", isAns, "fresh?", fresh);
 
-  if (!hasAns || !freshAns) {
+  if (!isAns || !fresh) {
     return Promise.reject(new Error("resolver: cache miss"));
   }
 
@@ -455,78 +452,4 @@ DNSResolver.prototype.resolveDnsFromCache = async function (rxid, packet) {
   const r = new Response(b, { headers: cacheutil.cacheHeaders() });
 
   return Promise.resolve(r);
-};
-
-/**
- * Resolve DNS request using HTTP/2 API of Node.js
- * @param {String} rxid - request id
- * @param {Request} request - Request object
- * @returns {Promise<Response>}
- */
-DNSResolver.prototype.doh2 = async function (rxid, request) {
-  if (!this.http2 || !this.nodeutil) {
-    throw new Error("h2 / node-util not setup, bailing");
-  }
-
-  this.log.d(rxid, "upstream with doh2");
-  const http2 = this.http2;
-
-  const u = new URL(request.url); // doh.tld/dns-query/?dns=b64
-  const verb = request.method; // GET or POST
-  const path = util.isGetRequest(request)
-    ? u.pathname + u.search // /dns-query/?dns=b64
-    : u.pathname; // /dns-query
-  const qab = await request.arrayBuffer(); // empty for GET
-  const upstreamQuery = bufutil.bufferOf(qab);
-  const headers = util.copyHeaders(request);
-
-  return new Promise((resolve, reject) => {
-    // TODO: h2 conn re-use: archive.is/XXKwn
-    // TODO: h2 conn pool
-    if (!util.isGetRequest(request) && !util.isPostRequest(request)) {
-      reject(new Error("Only GET/POST requests allowed"));
-    }
-
-    const c = http2.connect(u.origin);
-
-    c.on("error", (err) => {
-      this.log.e(rxid, "conn fail", err.message);
-      reject(err.message);
-    });
-
-    const req = c.request({
-      [http2.constants.HTTP2_HEADER_METHOD]: verb,
-      [http2.constants.HTTP2_HEADER_PATH]: path,
-      ...headers,
-    });
-
-    req.on("response", (headers) => {
-      const b = [];
-      req.on("data", (chunk) => {
-        b.push(chunk);
-      });
-      req.on("end", () => {
-        const rb = bufutil.concatBuf(b);
-        const h = this.nodeutil.transformPseudoHeaders(headers);
-        util.safeBox(() => c.close());
-        resolve(new Response(rb, h));
-      });
-    });
-    // nodejs' async err events go unhandled when the handler
-    // is not registered, which ends up killing the process
-    req.on("error", (err) => {
-      this.log.e(rxid, "send/recv fail", err.message);
-      reject(err.message);
-    });
-
-    // req.end writes query to upstream over http2.
-    // do this only after the event-handlers (response,
-    // on, end, error etc) have been registered (above),
-    // and not before. Those events aren't resent by
-    // nodejs; while they may in fact happen immediately
-    // post a req.write / req.end (for ex: an error if it
-    // happens pronto, before an event-handler could be
-    // registered, then the err would simply go unhandled)
-    req.end(upstreamQuery);
-  });
 };
