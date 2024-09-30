@@ -356,7 +356,7 @@ function trapServerEvents(s) {
 
     const id = tracker.trackConn(s, socket);
     if (!tracker.valid(id)) {
-      log.i("tcp: not tracking; server shutting down?");
+      log.i("tcp: not tracking; server shutting down?", id);
       close(socket);
       return;
     }
@@ -368,7 +368,7 @@ function trapServerEvents(s) {
     });
 
     socket.on("error", (err) => {
-      log.d("tcp: incoming conn closed with err; " + err.message);
+      log.d("tcp: incoming conn", id, "closed:", err.message);
       close(socket);
     });
 
@@ -411,7 +411,7 @@ function trapSecureServerEvents(s) {
 
     const id = tracker.trackConn(s, socket);
     if (!tracker.valid(id)) {
-      log.i("tls: not tracking; server shutting down?");
+      log.i("tls: not tracking; server shutting down?", id);
       close(socket);
       return;
     }
@@ -458,9 +458,22 @@ function trapSecureServerEvents(s) {
   s.on("tlsClientError", (err, /** @type {TLSSocket} */ tlsSocket) => {
     stats.tlserr += 1;
     // fly tcp healthchecks also trigger tlsClientErrors
-    log.d("tls: client err; " + err.message);
+    log.d("tls: client err;", err.message, addrstr(tlsSocket));
     close(tlsSocket);
   });
+}
+
+/**
+ * @param {TLSSocket|Socket} sock
+ */
+function addrstr(sock) {
+  if (!sock) return "";
+  if (sock.localAddress == null || sock.remoteAddress == null) return "";
+  return (
+    `[${sock.localAddress}]:${sock.localPort}` +
+    "->" +
+    `[${sock.remoteAddress}]:${sock.remotePort}`
+  );
 }
 
 /**
@@ -841,7 +854,6 @@ async function handleTCPQuery(q, socket, host, flag) {
   if (bufutil.emptyBuf(q) || !tcpOkay(socket)) return;
 
   const rxid = util.xid();
-  const t = log.startTime("handle-tcp-query-" + rxid);
   try {
     const r = await resolveQuery(rxid, q, host, flag);
     if (bufutil.emptyBuf(r)) {
@@ -856,7 +868,6 @@ async function handleTCPQuery(q, socket, host, flag) {
     ok = false;
     log.w(rxid, "tcp: send fail, err", e);
   }
-  log.endTime(t);
 
   // close socket when !ok
   if (!ok) {
@@ -941,8 +952,6 @@ async function serveHTTPS(req, res) {
 
   const buffers = [];
 
-  const t = log.startTime("recv-https");
-
   // if using for await loop, then it must be wrapped in a
   // try-catch block: stackoverflow.com/questions/69169226
   // if not, errors from reading req escapes unhandled.
@@ -953,8 +962,6 @@ async function serveHTTPS(req, res) {
   req.on("end", () => {
     const b = bufutil.concatBuf(buffers);
     const bLen = b.byteLength;
-
-    log.endTime(t);
 
     if (util.isPostRequest(req) && !dnsutil.validResponseSize(b)) {
       res.writeHead(dnsutil.dohStatusCode(b), util.corsHeadersIfNeeded(ua));
@@ -976,7 +983,6 @@ async function handleHTTPRequest(b, req, res) {
   heartbeat();
 
   const rxid = util.xid();
-  const t = log.startTime("handle-http-req-" + rxid);
   try {
     let host = req.headers.host || req.headers[":authority"];
     if (isIPv6(host)) host = `[${host}]`;
@@ -995,11 +1001,7 @@ async function handleHTTPRequest(b, req, res) {
       body: req.method === "POST" ? b : null,
     });
 
-    log.lapTime(t, "upstream-start");
-
     const fRes = await handleRequest(util.mkFetchEvent(fReq));
-
-    log.lapTime(t, "upstream-end");
 
     if (!resOkay(res)) {
       throw new Error("res not writable 1");
@@ -1007,13 +1009,9 @@ async function handleHTTPRequest(b, req, res) {
 
     res.writeHead(fRes.status, util.copyHeaders(fRes));
 
-    log.lapTime(t, "send-head");
-
     // ans may be null on non-2xx responses, such as redirects (3xx) by cc.js
     // or 4xx responses on timeouts or 5xx on invalid http method
     const ans = await fRes.arrayBuffer();
-
-    log.lapTime(t, "recv-ans");
 
     if (!resOkay(res)) {
       throw new Error("res not writable 2");
@@ -1030,8 +1028,6 @@ async function handleHTTPRequest(b, req, res) {
     if (!ok) resClose(res);
     log.w(e);
   }
-
-  log.endTime(t);
 }
 
 /**
@@ -1152,25 +1148,11 @@ function adjustMaxConns(n) {
     stopAfter(0);
     return;
   } else if (adj > stresspoint) {
-    log.w(
-      "load: stress; lowram?",
-      lowram,
-      "freemem:",
-      freemem,
-      "totmem:",
-      totmem
-    );
+    log.w("load: stress; lowram?", lowram, "mem:", freemem, " / ", totmem);
     log.w("load: stress; n:", nstr, "adjs:", adj, "avgs:", avg1, avg5, avg15);
     n = (minc / 2) | 0;
   } else if (adj > 0) {
-    log.d(
-      "load: high; lowram?",
-      lowram,
-      "freemem:",
-      freemem,
-      "totmem:",
-      totmem
-    );
+    log.d("load: high; lowram?", lowram, "mem:", freemem, " / ", totmem);
     log.d("load: high; n:", nstr, "adjs:", adj, "avgs:", avg1, avg5, avg15);
   }
 
