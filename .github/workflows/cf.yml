@@ -63,7 +63,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: 🛒 Checkout
-        uses: actions/checkout@v3.3.0
+        uses: actions/checkout@v4
         with:
           ref: ${{ env.GIT_REF }}
           fetch-depth: 0
@@ -114,8 +114,9 @@ jobs:
           # input overrides env-defaults, regardless
           environment: ${{ env.WORKERS_ENV }}
           wranglerVersion: ${{ env.WRANGLER_VER }}
+          accountId: ${{ secrets.CF_ACCOUNT_ID }}
         env:
-          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+          # setting CLOUDFLARE_ACCOUNT_ID no longer works
           GIT_COMMIT_ID: ${{ env.COMMIT_SHA }}
 
       - name: 🎤 Notice
